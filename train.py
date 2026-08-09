@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from typing import cast
 from typing_extensions import override
 from helpers import (
     DataSplit,
@@ -16,6 +15,7 @@ from helpers import (
 vocab_size = -1
 time_size = 8
 batch_size = 32
+n_embd = 32
 training_steps = 10000
 lr = 1e-3
 eval_iters = training_steps // 10
@@ -37,15 +37,17 @@ def extract_data() -> DataSplit:
 
 
 class BigramLanguageModel(nn.Module):
-    def __init__(self, vocab_size: int):
+    def __init__(self):
         super().__init__()
-        self.embedding_table: nn.Embedding = nn.Embedding(vocab_size, vocab_size)
+        self.embedding_table: nn.Embedding = nn.Embedding(vocab_size, n_embd)
+        self.lm_head: nn.Linear = nn.Linear(n_embd, vocab_size)
 
     @override
     def forward(
         self, batch: torch.Tensor, targets: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        logits = cast(torch.Tensor, self.embedding_table(batch))
+        token_embd = self.embedding_table(batch)
+        logits = self.lm_head(token_embd)
 
         loss = None
         if targets is not None:
@@ -58,7 +60,7 @@ class BigramLanguageModel(nn.Module):
 
     def generate(self, ctx: torch.Tensor, max_tokens: int) -> torch.Tensor:
         for _ in range(max_tokens):
-            logits, _ = cast(tuple[torch.Tensor, torch.Tensor], self(ctx))
+            logits, _ = self(ctx)
             logits = logits[:, -1, :]  # Isolate the last time dimension -> (B, C)
             probs = F.softmax(logits, dim=1)
             next_token = torch.multinomial(probs, num_samples=1)
@@ -75,7 +77,7 @@ class BigramLanguageModel(nn.Module):
         losses = torch.zeros(eval_iters)
         for step in range(eval_iters):
             xb, yb = generate_batch(data_split.train, batch_size, time_size)
-            _, loss = cast(tuple[torch.Tensor, torch.Tensor], self(xb, yb))
+            _, loss = self(xb, yb)
             losses[step] = loss
         eval_split.train_loss = losses.mean(dim=0).item()
 
@@ -83,7 +85,7 @@ class BigramLanguageModel(nn.Module):
         losses = torch.zeros(eval_iters)
         for step in range(eval_iters):
             xb, yb = generate_batch(data_split.val, batch_size, time_size)
-            _, loss = cast(tuple[torch.Tensor, torch.Tensor], self(xb, yb))
+            _, loss = self(xb, yb)
             losses[step] = loss
         eval_split.val_loss = losses.mean(dim=0).item()
 
@@ -94,20 +96,20 @@ class BigramLanguageModel(nn.Module):
 
 def train() -> BigramLanguageModel:
     data_split = extract_data()
-    bigram_model = BigramLanguageModel(vocab_size)
+    bigram_model = BigramLanguageModel()
 
     optimizer = torch.optim.AdamW(bigram_model.parameters(), lr=lr)
     for step in range(training_steps):
         xb, yb = generate_batch(data_split.train, batch_size, time_size)
-        _, loss = cast(tuple[torch.Tensor, torch.Tensor], bigram_model(xb, yb))
+        _, loss = bigram_model(xb, yb)
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()  # pyright: ignore[reportUnknownMemberType, reportUnusedCallResult]
-        optimizer.step()  # pyright: ignore[reportUnknownMemberType, reportUnusedCallResult]
+        loss.backward()
+        optimizer.step()
 
         if step % eval_interval == 0:
             eval_split = bigram_model.evaluate_loss(data_split)
             print(
-                f"Training loss = {eval_split.train_loss}\tValidation loss = {eval_split.val_loss}\n"
+                f"Iterations: {step}\tTraining loss = {eval_split.train_loss}\tValidation loss = {eval_split.val_loss}\n"
             )
 
     return bigram_model

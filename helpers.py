@@ -1,5 +1,4 @@
 import torch
-from typing import cast
 from dataclasses import dataclass
 
 
@@ -26,7 +25,7 @@ class EvalSplit:
     val_loss: float = 0
 
 
-_ = torch.manual_seed(1337)  # pyright: ignore[reportUnknownMemberType]  # temp for watching
+torch.manual_seed(1337)  # temp for watching
 
 
 def generate_batch(
@@ -53,8 +52,7 @@ class Tokenizer:
 
     # Assumes a two dimensional (batch, text) input tensor
     def decode_stream(self, input: torch.Tensor) -> str:
-        char_indices = cast(list[int], input.view(-1).tolist())  # pyright: ignore[reportUnknownMemberType]
-
+        char_indices: list[int] = input.view(-1).tolist()
         return "".join(self.itos[idx] for idx in char_indices)
 
     def get_data_split(
