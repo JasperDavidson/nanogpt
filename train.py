@@ -5,11 +5,14 @@ from typing import cast
 from typing_extensions import override
 from helpers import DataSplit, Tokenizer, extract_input, extract_vocab, generate_batch
 
+# --- Hyperparameters ---
 vocab_size = -1
 time_size = 8
 batch_size = 32
 training_steps = 10000
 lr = 1e-3
+
+tokenizer: Tokenizer = Tokenizer()
 
 
 def extract_data() -> DataSplit:
@@ -18,10 +21,9 @@ def extract_data() -> DataSplit:
     input = extract_input()
     vocab = extract_vocab()
     vocab_size = len(vocab)
-    t = Tokenizer()
-    t.generate_tokenizer(vocab)
+    tokenizer.generate_tokenizer(vocab)
 
-    data = t.get_data_split(input, val_percentage=0.1, test_percentage=0.1)
+    data = tokenizer.get_data_split(input, val_percentage=0.1, test_percentage=0.1)
     return data
 
 
@@ -36,12 +38,11 @@ class BigramLanguageModel(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         logits = cast(torch.Tensor, self.embedding_table(batch))
 
-        B, T, C = logits.shape
-        logits = logits.view(B * T, C)
-
         loss = None
         if targets is not None:
+            B, T, C = logits.shape
             targets = targets.view(B * T)
+            logits = logits.view(B * T, C)
             loss = F.cross_entropy(logits, targets)
 
         return (logits, loss)
@@ -57,7 +58,7 @@ class BigramLanguageModel(nn.Module):
         return ctx
 
 
-def train():
+def train() -> BigramLanguageModel:
     data_split = extract_data()
     bigram_model = BigramLanguageModel(vocab_size)
 
@@ -72,6 +73,11 @@ def train():
         if step % (training_steps // 10) == 0:
             print(loss.item())
 
+    return bigram_model
+
 
 if __name__ == "__main__":
-    train()
+    bigram_model = train()
+
+    init_ctx = torch.zeros((1, 1), dtype=torch.long)
+    print(tokenizer.decode_stream(bigram_model.generate(init_ctx, max_tokens=500)))
