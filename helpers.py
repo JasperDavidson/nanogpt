@@ -12,11 +12,27 @@ def extract_vocab() -> list[str]:
     with open("input.txt", "r", encoding="utf-8") as f:
         return sorted(list(set(f.read())))
 
+
 @dataclass(slots=True)
 class DataSplit:
     train: torch.Tensor
     val: torch.Tensor
     test: torch.Tensor
+
+torch.manual_seed(1337) # temp for watching
+
+def generate_batch(
+    data: torch.Tensor, batch_size: int, block_size: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    high_idx = len(data) - block_size
+    ind = torch.randint(low=0, high=high_idx, size=(batch_size,))
+    grid = ind[:, None] + torch.arange(block_size)
+
+    xb = data[grid]
+    yb = data[grid + 1]
+
+    return (xb, yb)
+
 
 class Tokenizer:
     def __init__(self):
