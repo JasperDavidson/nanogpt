@@ -5,7 +5,11 @@ from typing import cast
 from typing_extensions import override
 from helpers import DataSplit, Tokenizer, extract_input, extract_vocab, generate_batch
 
-vocab_size = 0
+vocab_size = -1
+time_size = 8
+batch_size = 32
+training_steps = 10000
+lr = 1e-3
 
 
 def extract_data() -> DataSplit:
@@ -36,7 +40,7 @@ class BigramLanguageModel(nn.Module):
         logits = logits.view(B * T, C)
 
         loss = None
-        if targets:
+        if targets is not None:
             targets = targets.view(B * T)
             loss = F.cross_entropy(logits, targets)
 
@@ -57,5 +61,17 @@ def train():
     data_split = extract_data()
     bigram_model = BigramLanguageModel(vocab_size)
 
-    xb, yb = generate_batch(data_split.train, 4, 8)
-    logits = cast(tuple[torch.Tensor, torch.Tensor], bigram_model(xb, yb))
+    optimizer = torch.optim.AdamW(bigram_model.parameters(), lr=lr)
+    for step in range(training_steps):
+        xb, yb = generate_batch(data_split.train, batch_size, time_size)
+        _, loss = cast(tuple[torch.Tensor, torch.Tensor], bigram_model(xb, yb))
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()  # pyright: ignore[reportUnknownMemberType, reportUnusedCallResult]
+        optimizer.step()  # pyright: ignore[reportUnknownMemberType, reportUnusedCallResult]
+
+        if step % (training_steps // 10) == 0:
+            print(loss.item())
+
+
+if __name__ == "__main__":
+    train()

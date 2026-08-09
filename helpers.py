@@ -19,14 +19,16 @@ class DataSplit:
     val: torch.Tensor
     test: torch.Tensor
 
+
 _ = torch.manual_seed(1337)  # pyright: ignore[reportUnknownMemberType]  # temp for watching
 
+
 def generate_batch(
-    data: torch.Tensor, batch_size: int, block_size: int
+    data: torch.Tensor, batch_size: int, time_size: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    high_idx = len(data) - block_size
+    high_idx = len(data) - time_size
     ind = torch.randint(low=0, high=high_idx, size=(batch_size,))
-    grid = ind[:, None] + torch.arange(block_size)
+    grid = ind[:, None] + torch.arange(time_size)
 
     xb = data[grid]
     yb = data[grid + 1]
