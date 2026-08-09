@@ -39,15 +39,19 @@ def extract_data() -> DataSplit:
 class BigramLanguageModel(nn.Module):
     def __init__(self):
         super().__init__()
-        self.embedding_table: nn.Embedding = nn.Embedding(vocab_size, n_embd)
+        self.tok_embedding_table: nn.Embedding = nn.Embedding(vocab_size, n_embd)
+        self.pos_embedding_table: nn.Embedding = nn.Embedding(time_size, n_embd)
         self.lm_head: nn.Linear = nn.Linear(n_embd, vocab_size)
 
     @override
     def forward(
         self, batch: torch.Tensor, targets: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        token_embd = self.embedding_table(batch)
-        logits = self.lm_head(token_embd)
+        _, T = batch.shape
+        token_embd = self.tok_embedding_table(batch)  # (B, T, C)
+        pos_embd = self.pos_embedding_table(torch.arange(T))  # (T, C)
+        x = token_embd + pos_embd
+        logits = self.lm_head(x)
 
         loss = None
         if targets is not None:
@@ -60,7 +64,9 @@ class BigramLanguageModel(nn.Module):
 
     def generate(self, ctx: torch.Tensor, max_tokens: int) -> torch.Tensor:
         for _ in range(max_tokens):
-            logits, _ = self(ctx)
+            # Position table only covers [0, time_size); never feed a longer window
+            ctx_cond = ctx[:, -time_size:]
+            logits, _ = self(ctx_cond)
             logits = logits[:, -1, :]  # Isolate the last time dimension -> (B, C)
             probs = F.softmax(logits, dim=1)
             next_token = torch.multinomial(probs, num_samples=1)
