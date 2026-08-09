@@ -19,7 +19,7 @@ class DataSplit:
     val: torch.Tensor
     test: torch.Tensor
 
-torch.manual_seed(1337) # temp for watching
+_ = torch.manual_seed(1337)  # pyright: ignore[reportUnknownMemberType]  # temp for watching
 
 def generate_batch(
     data: torch.Tensor, batch_size: int, block_size: int
