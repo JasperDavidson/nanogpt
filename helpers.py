@@ -20,6 +20,12 @@ class DataSplit:
     test: torch.Tensor
 
 
+@dataclass(slots=True)
+class EvalSplit:
+    train_loss: float = 0
+    val_loss: float = 0
+
+
 _ = torch.manual_seed(1337)  # pyright: ignore[reportUnknownMemberType]  # temp for watching
 
 

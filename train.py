@@ -3,7 +3,14 @@ import torch.nn as nn
 from torch.nn import functional as F
 from typing import cast
 from typing_extensions import override
-from helpers import DataSplit, Tokenizer, extract_input, extract_vocab, generate_batch
+from helpers import (
+    DataSplit,
+    EvalSplit,
+    Tokenizer,
+    extract_input,
+    extract_vocab,
+    generate_batch,
+)
 
 # --- Hyperparameters ---
 vocab_size = -1
@@ -11,6 +18,8 @@ time_size = 8
 batch_size = 32
 training_steps = 10000
 lr = 1e-3
+eval_iters = training_steps // 10
+eval_interval = training_steps // 10
 
 tokenizer: Tokenizer = Tokenizer()
 
@@ -57,6 +66,31 @@ class BigramLanguageModel(nn.Module):
 
         return ctx
 
+    @torch.no_grad
+    def evaluate_loss(self, data_split: DataSplit) -> EvalSplit:
+        _ = self.eval()
+        eval_split = EvalSplit()
+
+        # Train eval
+        losses = torch.zeros(eval_iters)
+        for step in range(eval_iters):
+            xb, yb = generate_batch(data_split.train, batch_size, time_size)
+            _, loss = cast(tuple[torch.Tensor, torch.Tensor], self(xb, yb))
+            losses[step] = loss
+        eval_split.train_loss = losses.mean(dim=0).item()
+
+        # Val eval
+        losses = torch.zeros(eval_iters)
+        for step in range(eval_iters):
+            xb, yb = generate_batch(data_split.val, batch_size, time_size)
+            _, loss = cast(tuple[torch.Tensor, torch.Tensor], self(xb, yb))
+            losses[step] = loss
+        eval_split.val_loss = losses.mean(dim=0).item()
+
+        _ = self.train()
+
+        return eval_split
+
 
 def train() -> BigramLanguageModel:
     data_split = extract_data()
@@ -70,8 +104,11 @@ def train() -> BigramLanguageModel:
         loss.backward()  # pyright: ignore[reportUnknownMemberType, reportUnusedCallResult]
         optimizer.step()  # pyright: ignore[reportUnknownMemberType, reportUnusedCallResult]
 
-        if step % (training_steps // 10) == 0:
-            print(loss.item())
+        if step % eval_interval == 0:
+            eval_split = bigram_model.evaluate_loss(data_split)
+            print(
+                f"Training loss = {eval_split.train_loss}\tValidation loss = {eval_split.val_loss}\n"
+            )
 
     return bigram_model
 
