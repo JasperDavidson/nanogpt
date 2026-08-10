@@ -13,9 +13,10 @@ from helpers import (
 
 # --- Hyperparameters ---
 vocab_size = -1
-time_size = 8
+time_dim = 32
 batch_size = 32
 n_embd = 32
+hidden_size = 64
 training_steps = 10000
 lr = 1e-3
 eval_iters = training_steps // 10
@@ -36,12 +37,44 @@ def extract_data() -> DataSplit:
     return data
 
 
+class SelfAttentionHead(nn.Module):
+    def __init__(self, in_dim: int, head_dim: int):
+        super().__init__()
+
+        self.head_dim = head_dim
+        self.query = nn.Linear(in_dim, head_dim, bias=False)
+        self.key = nn.Linear(in_dim, head_dim, bias=False)
+        self.value = nn.Linear(in_dim, head_dim, bias=False)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        q = self.query.forward(input)
+        k = self.key.forward(input)
+        v = self.value.forward(input)
+
+        affinity = (
+            q @ k.transpose(-2, -1)
+        )  # Note only transpose along (time, feature) dimension; attention is not cross-batch
+
+        T = input.shape[1]
+        tril = torch.tril(torch.ones(T, T))
+        affinity = affinity.masked_fill(tril == 0, float("-inf"))
+        affinity *= 1 / (self.head_dim**0.5)
+        affinity = F.softmax(
+            affinity, dim=-1
+        )  # Only softmax across the feature dimension
+
+        return affinity @ v
+
+
 class BigramLanguageModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.tok_embedding_table: nn.Embedding = nn.Embedding(vocab_size, n_embd)
-        self.pos_embedding_table: nn.Embedding = nn.Embedding(time_size, n_embd)
-        self.lm_head: nn.Linear = nn.Linear(n_embd, vocab_size)
+        self.pos_embedding_table: nn.Embedding = nn.Embedding(time_dim, n_embd)
+        self.attention_head: SelfAttentionHead = SelfAttentionHead(n_embd, n_embd)
+        self.hidden: nn.Linear = nn.Linear(n_embd, hidden_size)
+        self.relu = nn.ReLU()
+        self.lm_head: nn.Linear = nn.Linear(hidden_size, vocab_size)
 
     @override
     def forward(
@@ -51,7 +84,10 @@ class BigramLanguageModel(nn.Module):
         token_embd = self.tok_embedding_table(batch)  # (B, T, C)
         pos_embd = self.pos_embedding_table(torch.arange(T))  # (T, C)
         x = token_embd + pos_embd
-        logits = self.lm_head(x)
+
+        attention = self.attention_head(x)
+        hidden = self.relu(self.hidden(attention))
+        logits = self.lm_head(hidden)
 
         loss = None
         if targets is not None:
@@ -65,7 +101,7 @@ class BigramLanguageModel(nn.Module):
     def generate(self, ctx: torch.Tensor, max_tokens: int) -> torch.Tensor:
         for _ in range(max_tokens):
             # Position table only covers [0, time_size); never feed a longer window
-            ctx_cond = ctx[:, -time_size:]
+            ctx_cond = ctx[:, -time_dim:]
             logits, _ = self(ctx_cond)
             logits = logits[:, -1, :]  # Isolate the last time dimension -> (B, C)
             probs = F.softmax(logits, dim=1)
@@ -82,7 +118,7 @@ class BigramLanguageModel(nn.Module):
         # Train eval
         losses = torch.zeros(eval_iters)
         for step in range(eval_iters):
-            xb, yb = generate_batch(data_split.train, batch_size, time_size)
+            xb, yb = generate_batch(data_split.train, batch_size, time_dim)
             _, loss = self(xb, yb)
             losses[step] = loss
         eval_split.train_loss = losses.mean(dim=0).item()
@@ -90,7 +126,7 @@ class BigramLanguageModel(nn.Module):
         # Val eval
         losses = torch.zeros(eval_iters)
         for step in range(eval_iters):
-            xb, yb = generate_batch(data_split.val, batch_size, time_size)
+            xb, yb = generate_batch(data_split.val, batch_size, time_dim)
             _, loss = self(xb, yb)
             losses[step] = loss
         eval_split.val_loss = losses.mean(dim=0).item()
@@ -106,7 +142,7 @@ def train() -> BigramLanguageModel:
 
     optimizer = torch.optim.AdamW(bigram_model.parameters(), lr=lr)
     for step in range(training_steps):
-        xb, yb = generate_batch(data_split.train, batch_size, time_size)
+        xb, yb = generate_batch(data_split.train, batch_size, time_dim)
         _, loss = bigram_model(xb, yb)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
