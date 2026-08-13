@@ -21,6 +21,7 @@ training_steps = 10000
 lr = 1e-3
 eval_iters = training_steps // 10
 eval_interval = training_steps // 10
+num_heads = 4
 
 tokenizer: Tokenizer = Tokenizer()
 
@@ -37,33 +38,55 @@ def extract_data() -> DataSplit:
     return data
 
 
-class SelfAttentionHead(nn.Module):
-    def __init__(self, in_dim: int, head_dim: int):
+class SelfAttention(nn.Module):
+    def __init__(self, in_dim: int, head_dim: int, num_heads: int):
         super().__init__()
 
         self.head_dim = head_dim
-        self.query = nn.Linear(in_dim, head_dim, bias=False)
-        self.key = nn.Linear(in_dim, head_dim, bias=False)
-        self.value = nn.Linear(in_dim, head_dim, bias=False)
+        self.num_heads = num_heads
+
+        self.query = nn.Linear(in_dim, head_dim * num_heads, bias=False)
+        self.key = nn.Linear(in_dim, head_dim * num_heads, bias=False)
+        self.value = nn.Linear(in_dim, head_dim * num_heads, bias=False)
+
+        self.output = nn.Linear(head_dim * num_heads, head_dim * num_heads, bias=False)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        q = self.query.forward(input)
-        k = self.key.forward(input)
-        v = self.value.forward(input)
+        B = input.shape[0]
+        T = input.shape[1]
+        C = input.shape[2]
+
+        q = (
+            self.query.forward(input)
+            .view(B, T, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        k = (
+            self.key.forward(input)
+            .view(B, T, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        v = (
+            self.value.forward(input)
+            .view(B, T, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+        )
 
         affinity = (
             q @ k.transpose(-2, -1)
         )  # Note only transpose along (time, feature) dimension; attention is not cross-batch
 
-        T = input.shape[1]
-        tril = torch.tril(torch.ones(T, T))
+        tril = torch.tril(torch.ones(self.num_heads, T, T))
         affinity = affinity.masked_fill(tril == 0, float("-inf"))
-        affinity *= 1 / (self.head_dim**0.5)
+        affinity *= (
+            1 / (self.head_dim**0.5)
+        )  # Reduce the variance after head_dim ~mean=0, variance=1 elements accumulate through dot
         affinity = F.softmax(
             affinity, dim=-1
         )  # Only softmax across the feature dimension
 
-        return affinity @ v
+        a_out = (affinity @ v).transpose(1, 2).contiguous().view(B, T, C)
+        return self.output.forward(a_out)
 
 
 class BigramLanguageModel(nn.Module):
@@ -71,7 +94,9 @@ class BigramLanguageModel(nn.Module):
         super().__init__()
         self.tok_embedding_table: nn.Embedding = nn.Embedding(vocab_size, n_embd)
         self.pos_embedding_table: nn.Embedding = nn.Embedding(time_dim, n_embd)
-        self.attention_head: SelfAttentionHead = SelfAttentionHead(n_embd, n_embd)
+        self.attention_head: SelfAttention = SelfAttention(
+            n_embd, int(n_embd / num_heads), num_heads
+        )
         self.hidden: nn.Linear = nn.Linear(n_embd, hidden_size)
         self.relu = nn.ReLU()
         self.lm_head: nn.Linear = nn.Linear(hidden_size, vocab_size)
