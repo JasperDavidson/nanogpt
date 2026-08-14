@@ -1,3 +1,4 @@
+from pyexpat import model
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -15,8 +16,7 @@ from helpers import (
 vocab_size = -1
 time_dim = 32
 batch_size = 32
-n_embd = 32
-hidden_size = 64
+model_dim = 32
 training_steps = 10000
 lr = 1e-3
 eval_iters = training_steps // 10
@@ -45,6 +45,7 @@ class SelfAttention(nn.Module):
         self.head_dim = head_dim
         self.num_heads = num_heads
 
+        self.layer_norm = nn.LayerNorm((model_dim))
         self.query = nn.Linear(in_dim, head_dim * num_heads, bias=False)
         self.key = nn.Linear(in_dim, head_dim * num_heads, bias=False)
         self.value = nn.Linear(in_dim, head_dim * num_heads, bias=False)
@@ -56,18 +57,19 @@ class SelfAttention(nn.Module):
         T = input.shape[1]
         C = input.shape[2]
 
+        ln_input = self.layer_norm(input)
         q = (
-            self.query.forward(input)
+            self.query.forward(ln_input)
             .view(B, T, self.num_heads, self.head_dim)
             .transpose(1, 2)
         )
         k = (
-            self.key.forward(input)
+            self.key.forward(ln_input)
             .view(B, T, self.num_heads, self.head_dim)
             .transpose(1, 2)
         )
         v = (
-            self.value.forward(input)
+            self.value.forward(ln_input)
             .view(B, T, self.num_heads, self.head_dim)
             .transpose(1, 2)
         )
@@ -89,17 +91,31 @@ class SelfAttention(nn.Module):
         return self.output.forward(a_out)
 
 
+class NormHidden(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        self.linear = nn.Linear(model_dim, model_dim, bias=False)
+        self.layer_norm = nn.LayerNorm((model_dim))
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        ln_input = self.layer_norm(input)
+        hidden_out = self.linear(ln_input)
+
+        return hidden_out
+
+
 class BigramLanguageModel(nn.Module):
     def __init__(self):
         super().__init__()
-        self.tok_embedding_table: nn.Embedding = nn.Embedding(vocab_size, n_embd)
-        self.pos_embedding_table: nn.Embedding = nn.Embedding(time_dim, n_embd)
+        self.tok_embedding_table: nn.Embedding = nn.Embedding(vocab_size, model_dim)
+        self.pos_embedding_table: nn.Embedding = nn.Embedding(time_dim, model_dim)
         self.attention_head: SelfAttention = SelfAttention(
-            n_embd, int(n_embd / num_heads), num_heads
+            model_dim, int(model_dim / num_heads), num_heads
         )
-        self.hidden: nn.Linear = nn.Linear(n_embd, hidden_size)
+        self.hidden: NormHidden = NormHidden()
         self.relu = nn.ReLU()
-        self.lm_head: nn.Linear = nn.Linear(hidden_size, vocab_size)
+        self.lm_head: nn.Linear = nn.Linear(model_dim, vocab_size)
 
     @override
     def forward(
@@ -110,8 +126,8 @@ class BigramLanguageModel(nn.Module):
         pos_embd = self.pos_embedding_table(torch.arange(T))  # (T, C)
         x = token_embd + pos_embd
 
-        attention = self.attention_head(x)
-        hidden = self.relu(self.hidden(attention))
+        attention = self.attention_head(x) + x
+        hidden = self.relu(self.hidden(attention)) + attention
         logits = self.lm_head(hidden)
 
         loss = None
