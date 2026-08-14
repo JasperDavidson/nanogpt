@@ -7,16 +7,14 @@ from helpers import (
     DataSplit,
     EvalSplit,
     Tokenizer,
-    extract_input,
-    extract_vocab,
     generate_batch,
 )
 
 # --- Hyperparameters ---
 vocab_size = -1
-time_dim = 32
+time_dim = 64
 batch_size = 32
-model_dim = 32
+model_dim = 128
 training_steps = 100000
 lr = 1e-3
 eval_iters = training_steps // 10
@@ -29,12 +27,13 @@ tokenizer: Tokenizer = Tokenizer()
 def extract_data() -> DataSplit:
     global vocab_size
 
-    input = extract_input()
-    vocab = extract_vocab()
-    vocab_size = len(vocab)
-    tokenizer.generate_tokenizer(vocab)
+    data = tokenizer.get_data_split(val_percentage=0.1, test_percentage=0.1)
+    vocab_size = tokenizer.get_vocab_size()
 
-    data = tokenizer.get_data_split(input, val_percentage=0.1, test_percentage=0.1)
+    print(f"train shape: {len(data.train.shape)}")
+    print(f"val shape: {len(data.val.shape)}")
+    print(f"test shape: {len(data.test.shape)}")
+
     return data
 
 
@@ -130,6 +129,7 @@ class BigramLanguageModel(nn.Module):
             [TransformerBlock(time_dim, model_dim, num_heads) for _ in range(4)]
         )
 
+        self.layer_norm = nn.LayerNorm(model_dim)
         self.lm_head: nn.Linear = nn.Linear(model_dim, vocab_size)
 
     @override
@@ -144,6 +144,7 @@ class BigramLanguageModel(nn.Module):
         for trans_block in self.trans_blocks:
             x = trans_block(x)
 
+        x = self.layer_norm(x)
         logits = self.lm_head(x)
 
         loss = None
