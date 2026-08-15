@@ -22,11 +22,11 @@ torch.manual_seed(1337)  # temp for watching
 
 
 def generate_batch(
-    data: torch.Tensor, batch_size: int, time_size: int
+    data: torch.Tensor, d_batch: int, d_time: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    high_idx = len(data) - time_size
-    ind = torch.randint(low=0, high=high_idx, size=(batch_size,))
-    grid = ind[:, None] + torch.arange(time_size)
+    high_idx = len(data) - d_time
+    ind = torch.randint(low=0, high=high_idx, size=(d_batch,))
+    grid = ind[:, None] + torch.arange(d_time)
 
     xb = data[grid]
     yb = data[grid + 1]
@@ -40,7 +40,7 @@ class Tokenizer:
     def __init__(self):
         self.next_id = 256
         self.bpe_mapping: dict[int, tuple[int, int]] = {}
-        self.vocab_size: int = -1
+        self.d_vocab: int = -1
 
     def encode_bpe(self) -> torch.Tensor:
         pair_vocab: dict[int, tuple[int, int]] = {}
@@ -81,13 +81,11 @@ class Tokenizer:
             self.next_id += 1
 
         self.bpe_mapping = pair_vocab
-        self.vocab_size = self.next_id
-        print(f"vocab size: {self.vocab_size}")
+        self.d_vocab = self.next_id
         return torch.tensor(token_list)
 
     def get_vocab_size(self) -> int:
-        print(f"vocab size: {self.vocab_size}")
-        return self.vocab_size
+        return self.d_vocab
 
     def expand_encoding(self, encoding: int) -> list[int]:
         if encoding <= 255:
@@ -118,8 +116,6 @@ class Tokenizer:
         test_n = int(n * test_percentage)
         val_n = int(n * val_percentage)
         train_n = n - test_n - val_n
-
-        print(f"encoded shape: {encoded.shape}")
 
         return DataSplit(
             train=encoded[:train_n],
