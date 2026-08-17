@@ -1,0 +1,21 @@
+{
+  "d_time": 64,
+  "d_batch": 32,
+  "d_model": 256,
+  "n_heads": 8,
+  "n_layers": 4,
+  "lr": 0.0031622776601683794,
+  "dropout": 0.2,
+  "training_steps": 100000,
+  "eval_iters": 64,
+  "eval_interval": 10000,
+  "early_stop_patience": 2,
+  "seed": 1337,
+  "sweep": {
+    "best_val_loss": 3.9186155796051025,
+    "best_train_loss": 2.9838967323303223,
+    "search_steps": 8000,
+    "search_best_step": 3200,
+    "diverged": false
+  }
+}
