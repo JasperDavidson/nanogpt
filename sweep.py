@@ -44,7 +44,7 @@ class SearchSpace:
     d_model_start: int = 128
     d_time_start: int = 64
     dropout_start: float = 0.2
-    d_batch: int = 32
+    d_training_batch: int = 32
     n_layers: int = 4
     hold_tokens_per_step: bool = True
 
@@ -135,7 +135,7 @@ def base_config(space: SearchSpace) -> TrainConfig:
         )
     return TrainConfig(
         d_time=space.d_time_start,
-        d_batch=space.d_batch,
+        d_training_batch=space.d_training_batch,
         d_model=space.d_model_start,
         n_heads=space.d_model_start // space.d_head,
         n_layers=space.n_layers,
@@ -175,7 +175,7 @@ def format_cfg(cfg: TrainConfig) -> str:
     d_head = cfg.d_model // cfg.n_heads
     return (
         f"lr={cfg.lr:.4g} d_model={cfg.d_model} n_heads={cfg.n_heads} "
-        f"(d_head={d_head}) d_time={cfg.d_time} d_batch={cfg.d_batch} "
+        f"(d_head={d_head}) d_time={cfg.d_time} d_training_batch={cfg.d_training_batch} "
         f"dropout={cfg.dropout:.3g} steps={cfg.training_steps}"
     )
 
@@ -262,7 +262,7 @@ def print_space(space: SearchSpace) -> None:
     print(f"  dropout: {['{:.3g}'.format(v) for v in dropout_grid(space)]}")
     print(
         f"  start:   d_model={space.d_model_start} d_time={space.d_time_start} "
-        f"dropout={space.dropout_start} d_batch={space.d_batch}"
+        f"dropout={space.dropout_start} d_training_batch={space.d_training_batch}"
     )
     print(
         f"  budget:  lr_steps={space.lr_steps} stage_steps={space.stage_steps} "
@@ -270,16 +270,18 @@ def print_space(space: SearchSpace) -> None:
     )
     if space.hold_tokens_per_step:
         print(
-            f"  d_batch scales with d_time to hold "
-            f"{space.d_batch * space.d_time_start} tokens/step"
+            f"  d_training_batch scales with d_time to hold "
+            f"{space.d_training_batch * space.d_time_start} tokens/step"
         )
 
 
 def apply_d_time(cfg: TrainConfig, space: SearchSpace, d_time: int) -> TrainConfig:
-    d_batch = cfg.d_batch
+    d_training_batch = cfg.d_training_batch
     if space.hold_tokens_per_step:
-        d_batch = scaled_batch(space.d_batch, space.d_time_start, d_time)
-    return replace(cfg, d_time=d_time, d_batch=d_batch)
+        d_training_batch = scaled_batch(
+            space.d_training_batch, space.d_time_start, d_time
+        )
+    return replace(cfg, d_time=d_time, d_training_batch=d_training_batch)
 
 
 def staged_search(
@@ -330,7 +332,7 @@ def staged_search(
             time_results.append(result)
     winner = pick_best(time_results).config
     print(
-        f"best d_time={winner.d_time} d_batch={winner.d_batch} "
+        f"best d_time={winner.d_time} d_training_batch={winner.d_training_batch} "
         f"val={pick_best(time_results).best_val_loss:.4f}"
     )
 
@@ -437,7 +439,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--dropout-values", type=str, default=None, help="e.g. 0,0.1,0.2")
     parser.add_argument("--dropout-start", type=float, default=defaults.dropout_start)
 
-    parser.add_argument("--d-batch", type=int, default=defaults.d_batch)
+    parser.add_argument("--d-training-batch", type=int, default=defaults.d_training_batch)
     parser.add_argument("--n-layers", type=int, default=defaults.n_layers)
     parser.add_argument(
         "--hold-tokens-per-step",
@@ -475,7 +477,7 @@ def space_from_args(args: argparse.Namespace) -> SearchSpace:
         d_model_start=args.d_model_start,
         d_time_start=args.d_time_start,
         dropout_start=args.dropout_start,
-        d_batch=args.d_batch,
+        d_training_batch=args.d_training_batch,
         n_layers=args.n_layers,
         hold_tokens_per_step=args.hold_tokens_per_step,
         lr_steps=args.lr_steps,

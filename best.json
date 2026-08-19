@@ -1,6 +1,6 @@
 {
   "d_time": 64,
-  "d_batch": 32,
+  "d_training_batch": 32,
   "d_model": 256,
   "n_heads": 8,
   "n_layers": 4,

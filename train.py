@@ -41,7 +41,8 @@ def _coerce_config_value(expected: type, value: object) -> Any:
 @dataclass(slots=True)
 class TrainConfig:
     d_time: int = 64
-    d_batch: int = 32
+    d_training_batch: int = 32
+    d_decode_batch: int = 1
     d_model: int = 128
     n_heads: int = 4
     n_layers: int = 4
@@ -57,8 +58,10 @@ class TrainConfig:
     def illegal_reason(self) -> str | None:
         if self.d_time < 1:
             return "d_time < 1"
-        if self.d_batch < 1:
-            return "d_batch < 1"
+        if self.d_training_batch < 1:
+            return "d_training_batch < 1"
+        if self.d_decode_batch < 1:
+            return "d_decode_batch < 1"
         if self.d_model < 1:
             return "d_model < 1"
         if self.n_heads < 1:
@@ -83,7 +86,7 @@ class TrainConfig:
         return None
 
     def tokens_per_step(self) -> int:
-        return self.d_batch * self.d_time
+        return self.d_training_batch * self.d_time
 
     def to_json_dict(self) -> dict[str, object]:
         data = asdict(self)
@@ -121,6 +124,8 @@ class TrainConfig:
             updates[field.name] = _coerce_config_value(
                 type(getattr(defaults, field.name)), raw[field.name]
             )
+        if "d_training_batch" not in updates and "d_batch" in raw:
+            updates["d_training_batch"] = _coerce_config_value(int, raw["d_batch"])
         return replace(defaults, **updates)
 
     @classmethod
@@ -195,50 +200,105 @@ def context_fits(cfg: TrainConfig, data_split: DataSplit) -> str | None:
     return None
 
 
+class KVBuffer:
+    def __init__(
+        self,
+        batch_size: int,
+        num_heads: int,
+        max_seq_len: int,
+        head_dim: int,
+        dtype=torch.float32,
+    ):
+        self.k_cache = torch.empty(
+            batch_size, num_heads, max_seq_len, head_dim, dtype=dtype
+        )
+        self.v_cache = torch.empty(
+            batch_size, num_heads, max_seq_len, head_dim, dtype=dtype
+        )
+
+        self.cur_len = 0
+
+    def update_buffer(
+        self, k: torch.Tensor, v: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Extract kv cache tokens and insert per-batch/per-head
+        new_tokens = k.shape[2]
+        start_idx = self.cur_len
+        end_idx = self.cur_len + new_tokens
+
+        self.k_cache[:, :, start_idx:end_idx, :] = k
+        self.v_cache[:, :, start_idx:end_idx, :] = v
+
+        self.cur_len = end_idx
+
+        return (self.k_cache[:, :, :end_idx, :], self.v_cache[:, :, :end_idx, :])
+
+
 class SelfAttention(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, dropout: float):
+    def __init__(
+        self,
+        d_decode_batch: int,
+        d_model: int,
+        n_heads: int,
+        d_time: int,
+        dropout: float,
+        dtype=torch.float32,
+    ):
         super().__init__()
 
         self.d_head = d_model // n_heads
         self.n_heads = n_heads
+        self.d_time = d_time
+        self.dtype = dtype
 
-        self.layer_norm = nn.LayerNorm((d_model))
-        self.query = nn.Linear(d_model, d_model, bias=False)
-        self.key = nn.Linear(d_model, d_model, bias=False)
-        self.value = nn.Linear(d_model, d_model, bias=False)
+        self.layer_norm = nn.LayerNorm((d_model), dtype=dtype)
+        self.q_proj = nn.Linear(d_model, d_model, bias=False, dtype=dtype)
+        self.k_proj = nn.Linear(d_model, d_model, bias=False, dtype=dtype)
+        self.v_proj = nn.Linear(d_model, d_model, bias=False, dtype=dtype)
+        self.kv_buf = KVBuffer(
+            d_decode_batch, n_heads, d_time, self.d_head, dtype=dtype
+        )
 
-        self.output = nn.Linear(d_model, d_model, bias=False)
+        self.o_proj = nn.Linear(d_model, d_model, bias=False, dtype=dtype)
         self.attn_dropout = nn.Dropout(dropout)
         self.resid_dropout = nn.Dropout(dropout)
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
+    def forward(self, prefill: bool, input: torch.Tensor) -> torch.Tensor:
         d_batch = input.shape[0]
         d_time = input.shape[1]
         d_model = input.shape[2]
 
         ln_input = self.layer_norm(input)
         q = (
-            self.query.forward(ln_input)
+            self.q_proj.forward(ln_input)
             .view(d_batch, d_time, self.n_heads, self.d_head)
             .transpose(1, 2)
         )
         k = (
-            self.key.forward(ln_input)
+            self.k_proj.forward(ln_input)
             .view(d_batch, d_time, self.n_heads, self.d_head)
             .transpose(1, 2)
         )
         v = (
-            self.value.forward(ln_input)
+            self.v_proj.forward(ln_input)
             .view(d_batch, d_time, self.n_heads, self.d_head)
             .transpose(1, 2)
         )
+
+        if not self.training and not prefill and self.kv_buf.cur_len != self.d_time:
+            k, v = self.kv_buf.update_buffer(k, v)
 
         affinity = (
             q @ k.transpose(-2, -1)
         )  # Note only transpose along (time, feature) dimension; attention is not cross-batch
 
-        tril = torch.tril(torch.ones(self.n_heads, d_time, d_time))
-        affinity = affinity.masked_fill(tril == 0, float("-inf"))
+        # Masked attention only needed during during training/prefill to prevent attention on future tokens
+        # Note decode will be [B, N, 1, H] x [B, N, H, S] -> [B, N, 1, S] so no masking is needed
+        if self.training or prefill:
+            tril = torch.tril(
+                torch.ones(self.n_heads, d_time, d_time, dtype=self.dtype)
+            )
+            affinity = affinity.masked_fill(tril == 0, float("-inf"))
         affinity *= (
             1 / (self.d_head**0.5)
         )  # Reduce the variance after d_head ~mean=0, variance=1 elements accumulate through dot
@@ -247,16 +307,18 @@ class SelfAttention(nn.Module):
         )  # Only softmax across the feature dimension
         affinity = self.attn_dropout(affinity)
 
-        a_out = (affinity @ v).transpose(1, 2).contiguous().view(d_batch, d_time, d_model)
-        return self.resid_dropout(self.output.forward(a_out))
+        a_out = (
+            (affinity @ v).transpose(1, 2).contiguous().view(d_batch, d_time, d_model)
+        )
+        return self.resid_dropout(self.o_proj.forward(a_out))
 
 
 class NormHidden(nn.Module):
-    def __init__(self, d_model: int, dropout: float):
+    def __init__(self, d_model: int, dropout: float, dtype=torch.float32):
         super().__init__()
 
-        self.linear = nn.Linear(d_model, d_model, bias=False)
-        self.layer_norm = nn.LayerNorm((d_model))
+        self.linear = nn.Linear(d_model, d_model, bias=False, dtype=dtype)
+        self.layer_norm = nn.LayerNorm((d_model), dtype=dtype)
         self.relu = nn.ReLU()
         self.resid_dropout = nn.Dropout(dropout)
 
@@ -268,47 +330,74 @@ class NormHidden(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, dropout: float):
+    def __init__(
+        self,
+        d_decode_batch: int,
+        d_model: int,
+        n_heads: int,
+        d_time: int,
+        dropout: float,
+        dtype=torch.float32,
+    ):
         super().__init__()
 
-        self.attn = SelfAttention(d_model, n_heads, dropout)
-        self.ffn = NormHidden(d_model, dropout)
+        self.attn = SelfAttention(
+            d_decode_batch, d_model, n_heads, d_time, dropout, dtype
+        )
+        self.ffn = NormHidden(d_model, dropout, dtype)
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        attention = self.attn(input) + input
+    def forward(self, prefill: bool, input: torch.Tensor) -> torch.Tensor:
+        attention = self.attn(prefill, input) + input
         hidden = self.ffn(attention) + attention
 
         return hidden
 
 
 class BigramLanguageModel(nn.Module):
-    def __init__(self, cfg: TrainConfig, d_vocab: int):
+    def __init__(self, cfg: TrainConfig, d_vocab: int, dtype=torch.float32):
         super().__init__()
         self.cfg = cfg
-        self.tok_embedding_table: nn.Embedding = nn.Embedding(d_vocab, cfg.d_model)
-        self.pos_embedding_table: nn.Embedding = nn.Embedding(cfg.d_time, cfg.d_model)
+        self.tok_embedding_table: nn.Embedding = nn.Embedding(
+            d_vocab, cfg.d_model, dtype=dtype
+        )
+        self.pos_embedding_table: nn.Embedding = nn.Embedding(
+            cfg.d_time, cfg.d_model, dtype=dtype
+        )
 
         self.trans_blocks = nn.ModuleList(
             [
-                TransformerBlock(cfg.d_model, cfg.n_heads, cfg.dropout)
+                TransformerBlock(
+                    cfg.d_decode_batch,
+                    cfg.d_model,
+                    cfg.n_heads,
+                    cfg.d_time,
+                    cfg.dropout,
+                    dtype,
+                )
                 for _ in range(cfg.n_layers)
             ]
         )
 
-        self.layer_norm = nn.LayerNorm(cfg.d_model)
-        self.lm_head: nn.Linear = nn.Linear(cfg.d_model, d_vocab)
+        self.layer_norm = nn.LayerNorm(cfg.d_model, dtype=dtype)
+        self.lm_head: nn.Linear = nn.Linear(cfg.d_model, d_vocab, dtype=dtype)
 
     @override
     def forward(
-        self, batch: torch.Tensor, targets: torch.Tensor | None = None
+        self,
+        prefill: bool,
+        batch: torch.Tensor,
+        targets: torch.Tensor | None = None,
+        pos_offset: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         _, d_time = batch.shape
         token_embd = self.tok_embedding_table(batch)  # (d_batch, d_time, d_model)
-        pos_embd = self.pos_embedding_table(torch.arange(d_time))  # (d_time, d_model)
+        pos_embd = self.pos_embedding_table(
+            torch.arange(d_time) + pos_offset
+        )  # (d_time, d_model)
         x = token_embd + pos_embd
 
         for trans_block in self.trans_blocks:
-            x = trans_block(x)
+            x = trans_block(prefill, x)
 
         x = self.layer_norm(x)
         logits = self.lm_head(x)
@@ -322,18 +411,29 @@ class BigramLanguageModel(nn.Module):
 
         return (logits, loss)
 
+    @torch.no_grad
     def generate(self, ctx: torch.Tensor, max_tokens: int) -> torch.Tensor:
         was_training = self.training
         _ = self.eval()
         d_time = self.cfg.d_time
+        ctx_size = ctx.shape[1]
+        decode_pos = ctx_size - 1
         for _ in range(max_tokens):
             # Position table only covers [0, d_time); never feed a longer window
-            ctx_cond = ctx[:, -d_time:]
-            logits, _ = self(ctx_cond)
-            logits = logits[:, -1, :]  # Isolate the last time dimension -> (d_batch, d_vocab)
+            if ctx_size == d_time:
+                ctx_cond = ctx[:, -d_time:]
+                logits, _ = self(True, ctx_cond)
+            else:
+                ctx_cond = ctx[:, -1:]
+                logits, _ = self(False, ctx_cond, pos_offset=decode_pos)
+                decode_pos += 1
+            logits = logits[
+                :, -1, :
+            ]  # Isolate the last time dimension -> (d_batch, d_vocab)
             probs = F.softmax(logits, dim=1)
             next_token = torch.multinomial(probs, num_samples=1)
             ctx = torch.cat((ctx, next_token), dim=1)
+            ctx_size = min(d_time, ctx.shape[1])
 
         if was_training:
             _ = self.train()
@@ -347,15 +447,15 @@ class BigramLanguageModel(nn.Module):
 
         losses = torch.zeros(cfg.eval_iters)
         for step in range(cfg.eval_iters):
-            xb, yb = generate_batch(data_split.train, cfg.d_batch, cfg.d_time)
-            _, loss = self(xb, yb)
+            xb, yb = generate_batch(data_split.train, cfg.d_training_batch, cfg.d_time)
+            _, loss = self(True, xb, yb)
             losses[step] = loss
         eval_split.train_loss = losses.mean(dim=0).item()
 
         losses = torch.zeros(cfg.eval_iters)
         for step in range(cfg.eval_iters):
-            xb, yb = generate_batch(data_split.val, cfg.d_batch, cfg.d_time)
-            _, loss = self(xb, yb)
+            xb, yb = generate_batch(data_split.val, cfg.d_training_batch, cfg.d_time)
+            _, loss = self(True, xb, yb)
             losses[step] = loss
         eval_split.val_loss = losses.mean(dim=0).item()
 
@@ -407,8 +507,8 @@ def train(
         return True
 
     for step in range(cfg.training_steps):
-        xb, yb = generate_batch(data_split.train, cfg.d_batch, cfg.d_time)
-        _, loss = model(xb, yb)
+        xb, yb = generate_batch(data_split.train, cfg.d_training_batch, cfg.d_time)
+        _, loss = model(False, xb, yb)
         if not torch.isfinite(loss):
             diverged = True
             steps_run = step + 1
@@ -441,7 +541,9 @@ def train(
 
 
 def _parse_train_args() -> TrainConfig:
-    parser = argparse.ArgumentParser(description="Train a nanoGPT run from a TrainConfig.")
+    parser = argparse.ArgumentParser(
+        description="Train a nanoGPT run from a TrainConfig."
+    )
     parser.add_argument(
         "--config",
         type=Path,
@@ -449,7 +551,8 @@ def _parse_train_args() -> TrainConfig:
         help="JSON from sweep (best.json) or JSONL with a winner=true record.",
     )
     parser.add_argument("--d-time", type=int, default=None)
-    parser.add_argument("--d-batch", type=int, default=None)
+    parser.add_argument("--d-training-batch", type=int, default=None)
+    parser.add_argument("--d-decode-batch", type=int, default=None)
     parser.add_argument("--d-model", type=int, default=None)
     parser.add_argument("--n-heads", type=int, default=None)
     parser.add_argument("--n-layers", type=int, default=None)
@@ -481,5 +584,6 @@ if __name__ == "__main__":
         f"(diverged={result.diverged})"
     )
 
-    init_ctx = torch.zeros((1, 1), dtype=torch.long)
-    print(tokenizer.decode_stream(bigram_model.generate(init_ctx, max_tokens=500)))
+    if not result.diverged:
+        init_ctx = torch.zeros((cfg.d_decode_batch, 1), dtype=torch.long)
+        print(tokenizer.decode_stream(bigram_model.generate(init_ctx, max_tokens=500)))
