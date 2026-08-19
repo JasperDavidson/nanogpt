@@ -1,8 +1,9 @@
 from collections import defaultdict
-import token
-import torch
 from dataclasses import dataclass
-from collections import defaultdict
+from pathlib import Path
+import json
+
+import torch
 
 
 @dataclass(slots=True)
@@ -36,15 +37,57 @@ def generate_batch(
 
 class Tokenizer:
     TARGET_VOCAB_SIZE = 1000
+    SOURCE_PATH = "input.txt"
+    CACHE_PATH = Path("tokenizer_cache.json")
 
     def __init__(self):
         self.next_id = 256
         self.bpe_mapping: dict[int, tuple[int, int]] = {}
         self.d_vocab: int = -1
 
+    def _load_cache(self) -> torch.Tensor | None:
+        if not self.CACHE_PATH.exists():
+            return None
+        try:
+            payload = json.loads(self.CACHE_PATH.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if (
+            payload.get("source") != self.SOURCE_PATH
+            or payload.get("max_vocab_size") != self.TARGET_VOCAB_SIZE
+        ):
+            return None
+        mapping = payload.get("bpe_mapping")
+        tokens = payload.get("tokens")
+        next_id = payload.get("next_id")
+        d_vocab = payload.get("d_vocab")
+        if not isinstance(mapping, dict) or not isinstance(tokens, list):
+            return None
+        if not isinstance(next_id, int) or not isinstance(d_vocab, int):
+            return None
+        self.bpe_mapping = {int(k): (int(v[0]), int(v[1])) for k, v in mapping.items()}
+        self.next_id = next_id
+        self.d_vocab = d_vocab
+        return torch.tensor(tokens)
+
+    def _save_cache(self, tokens: list[int]) -> None:
+        payload = {
+            "source": self.SOURCE_PATH,
+            "max_vocab_size": self.TARGET_VOCAB_SIZE,
+            "tokens": tokens,
+            "bpe_mapping": {str(k): list(v) for k, v in self.bpe_mapping.items()},
+            "next_id": self.next_id,
+            "d_vocab": self.d_vocab,
+        }
+        self.CACHE_PATH.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
     def encode_bpe(self) -> torch.Tensor:
+        cached = self._load_cache()
+        if cached is not None:
+            return cached
+
         pair_vocab: dict[int, tuple[int, int]] = {}
-        with open("input.txt", "r", encoding="utf-8") as f:
+        with open(self.SOURCE_PATH, "r", encoding="utf-8") as f:
             token_list = list(f.read().encode("utf-8"))
 
         while self.next_id < self.TARGET_VOCAB_SIZE:
@@ -82,6 +125,7 @@ class Tokenizer:
 
         self.bpe_mapping = pair_vocab
         self.d_vocab = self.next_id
+        self._save_cache(token_list)
         return torch.tensor(token_list)
 
     def get_vocab_size(self) -> int:
