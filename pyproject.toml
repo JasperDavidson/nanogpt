@@ -4,10 +4,16 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "numpy>=2.4.6",
+    "torch>=2.13.0",
+    "typing-extensions>=4.16.0",
+]
 
 # PyTorch stubs leave many APIs as Any/Unknown; strict unknown checks just add noise.
-[tool.basedpyright]
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
 typeCheckingMode = "standard"
 reportUnknownMemberType = false
 reportUnknownVariableType = false
@@ -15,4 +21,3 @@ reportUnknownArgumentType = false
 reportUnknownParameterType = false
 reportUnknownLambdaType = false
 reportUnusedCallResult = false
-reportAny = false

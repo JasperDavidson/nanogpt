@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 from collections import defaultdict
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 import json
@@ -130,6 +133,28 @@ class Tokenizer:
 
     def get_vocab_size(self) -> int:
         return self.d_vocab
+
+    def to_inference_dict(self) -> dict[str, object]:
+        return {
+            "bpe_mapping": {str(k): list(v) for k, v in self.bpe_mapping.items()},
+            "next_id": self.next_id,
+            "d_vocab": self.d_vocab,
+        }
+
+    @classmethod
+    def from_inference_dict(cls, data: Mapping[str, object]) -> Tokenizer:
+        mapping = data.get("bpe_mapping")
+        next_id = data.get("next_id")
+        d_vocab = data.get("d_vocab")
+        if not isinstance(mapping, dict):
+            raise TypeError("bpe_mapping must be a JSON object")
+        if not isinstance(next_id, int) or not isinstance(d_vocab, int):
+            raise TypeError("next_id and d_vocab must be ints")
+        tok = cls()
+        tok.bpe_mapping = {int(k): (int(v[0]), int(v[1])) for k, v in mapping.items()}
+        tok.next_id = next_id
+        tok.d_vocab = d_vocab
+        return tok
 
     def expand_encoding(self, encoding: int) -> list[int]:
         if encoding <= 255:

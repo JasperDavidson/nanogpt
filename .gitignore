@@ -1,3 +1,4 @@
 input.txt
 tokenizer_cache.json
 sweep_results.jsonl
+checkpoints/

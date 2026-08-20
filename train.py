@@ -14,6 +14,14 @@ import torch.nn as nn
 from torch.nn import functional as F
 from typing_extensions import override
 
+from checkpoint import (
+    MANIFEST_NAME,
+    dir_for_name,
+    load_manifest,
+    load_tensors,
+    load_tokenizer_payload,
+    save_checkpoint,
+)
 from helpers import (
     DataSplit,
     EvalSplit,
@@ -48,7 +56,7 @@ class TrainConfig:
     n_layers: int = 4
     lr: float = 1e-3
     dropout: float = 0.2
-    training_steps: int = 100000
+    training_steps: int = 10000
     eval_iters: int = 64
     eval_interval: int = 10000
     early_stop_patience: int = 2
@@ -464,14 +472,72 @@ class BigramLanguageModel(nn.Module):
         return eval_split
 
 
+def save_model_checkpoint(
+    dest: Path,
+    model: BigramLanguageModel,
+    tokenizer: Tokenizer,
+    *,
+    metrics: dict[str, object] | None = None,
+) -> None:
+    save_checkpoint(
+        dest,
+        config=model.cfg.to_json_dict(),
+        d_vocab=model.tok_embedding_table.num_embeddings,
+        named_tensors=model.named_parameters(),
+        tokenizer=tokenizer.to_inference_dict(),
+        metrics=metrics,
+    )
+
+
+def load_checkpoint(dest: Path) -> tuple[BigramLanguageModel, Tokenizer]:
+    dest = Path(dest)
+    manifest = load_manifest(dest)
+    cfg = TrainConfig.from_mapping(manifest["config"])
+    d_vocab = int(manifest["d_vocab"])
+    illegal = cfg.illegal_reason()
+    if illegal is not None:
+        raise ValueError(illegal)
+    model = BigramLanguageModel(cfg, d_vocab)
+    loaded = load_tensors(dest, manifest)
+    params = dict(model.named_parameters())
+    missing = params.keys() - loaded.keys()
+    extra = loaded.keys() - params.keys()
+    if missing or extra:
+        raise ValueError(
+            f"tensor name mismatch in {dest}: missing={sorted(missing)} extra={sorted(extra)}"
+        )
+    for name, tensor in loaded.items():
+        dest_param = params[name]
+        if tuple(dest_param.shape) != tuple(tensor.shape):
+            raise ValueError(
+                f"{name} shape {tuple(tensor.shape)} does not match "
+                f"model {tuple(dest_param.shape)}"
+            )
+        if dest_param.dtype != tensor.dtype:
+            raise ValueError(
+                f"{name} dtype {tensor.dtype} does not match model {dest_param.dtype}"
+            )
+        dest_param.data.copy_(tensor)
+    tokenizer = Tokenizer.from_inference_dict(load_tokenizer_payload(dest))
+    if tokenizer.d_vocab != d_vocab:
+        raise ValueError(
+            f"tokenizer d_vocab={tokenizer.d_vocab} does not match checkpoint {d_vocab}"
+        )
+    return model, tokenizer
+
+
 def train(
     cfg: TrainConfig,
     data_split: DataSplit,
     d_vocab: int,
+    tokenizer: Tokenizer | None = None,
+    checkpoint_dir: Path | None = None,
 ) -> tuple[BigramLanguageModel, TrialResult]:
     illegal = cfg.illegal_reason() or context_fits(cfg, data_split)
     if illegal is not None:
         raise ValueError(illegal)
+    if checkpoint_dir is not None and tokenizer is None:
+        raise ValueError("checkpoint_dir requires tokenizer")
 
     torch.manual_seed(cfg.seed)
     model = BigramLanguageModel(cfg, d_vocab)
@@ -500,6 +566,19 @@ def train(
             best_train_loss = eval_split.train_loss
             best_step = step
             patience_left = cfg.early_stop_patience
+            if checkpoint_dir is not None and tokenizer is not None:
+                save_model_checkpoint(
+                    checkpoint_dir,
+                    model,
+                    tokenizer,
+                    metrics={
+                        "best_step": best_step,
+                        "best_val_loss": best_val_loss,
+                        "best_train_loss": best_train_loss,
+                    },
+                )
+                if cfg.verbose:
+                    print(f"saved best checkpoint to {checkpoint_dir}\n")
         else:
             patience_left -= 1
             if patience_left <= 0:
@@ -526,6 +605,9 @@ def train(
         if last_step % cfg.eval_interval != 0:
             _ = consider_eval(last_step)
 
+    if checkpoint_dir is not None and (Path(checkpoint_dir) / MANIFEST_NAME).is_file():
+        model, _ = load_checkpoint(checkpoint_dir)
+
     tokens_seen = best_step * cfg.tokens_per_step()
     result = TrialResult(
         config=cfg,
@@ -540,7 +622,7 @@ def train(
     return model, result
 
 
-def _parse_train_args() -> TrainConfig:
+def _parse_train_args() -> tuple[TrainConfig, Path | None, Path | None]:
     parser = argparse.ArgumentParser(
         description="Train a nanoGPT run from a TrainConfig."
     )
@@ -563,6 +645,18 @@ def _parse_train_args() -> TrainConfig:
     parser.add_argument("--eval-interval", type=int, default=None)
     parser.add_argument("--early-stop-patience", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument(
+        "--save-checkpoint",
+        metavar="NAME",
+        default=None,
+        help="Write the best-so-far snapshot to checkpoints/NAME. Off unless set.",
+    )
+    parser.add_argument(
+        "--from-checkpoint",
+        metavar="NAME",
+        default=None,
+        help="Skip training and generate from checkpoints/NAME.",
+    )
     args = parser.parse_args()
     cfg = TrainConfig.load(args.config) if args.config is not None else TrainConfig()
     updates: dict[str, Any] = {}
@@ -572,18 +666,38 @@ def _parse_train_args() -> TrainConfig:
         value = getattr(args, field.name, None)
         if value is not None:
             updates[field.name] = value
-    return replace(cfg, **updates)
+    checkpoint_dir = (
+        dir_for_name(args.save_checkpoint) if args.save_checkpoint else None
+    )
+    from_checkpoint = (
+        dir_for_name(args.from_checkpoint) if args.from_checkpoint else None
+    )
+    return replace(cfg, **updates), checkpoint_dir, from_checkpoint
 
 
 if __name__ == "__main__":
-    cfg = _parse_train_args()
-    data_split, d_vocab, tokenizer = load_data()
-    bigram_model, result = train(cfg, data_split, d_vocab)
-    print(
-        f"best val={result.best_val_loss:.4f} at step {result.best_step} "
-        f"(diverged={result.diverged})"
-    )
-
-    if not result.diverged:
+    cfg, checkpoint_dir, from_checkpoint = _parse_train_args()
+    if from_checkpoint is not None:
+        bigram_model, tokenizer = load_checkpoint(from_checkpoint)
+        cfg = bigram_model.cfg
         init_ctx = torch.zeros((cfg.d_decode_batch, 1), dtype=torch.long)
         print(tokenizer.decode_stream(bigram_model.generate(init_ctx, max_tokens=500)))
+    else:
+        data_split, d_vocab, tokenizer = load_data()
+        bigram_model, result = train(
+            cfg,
+            data_split,
+            d_vocab,
+            tokenizer=tokenizer,
+            checkpoint_dir=checkpoint_dir,
+        )
+        print(
+            f"best val={result.best_val_loss:.4f} at step {result.best_step} "
+            f"(diverged={result.diverged})"
+        )
+
+        if not result.diverged:
+            init_ctx = torch.zeros((cfg.d_decode_batch, 1), dtype=torch.long)
+            print(
+                tokenizer.decode_stream(bigram_model.generate(init_ctx, max_tokens=500))
+            )
