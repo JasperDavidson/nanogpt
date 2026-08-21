@@ -226,6 +226,9 @@ class KVBuffer:
 
         self.cur_len = 0
 
+    def reset(self) -> None:
+        self.cur_len = 0
+
     def update_buffer(
         self, k: torch.Tensor, v: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -419,14 +422,25 @@ class BigramLanguageModel(nn.Module):
 
         return (logits, loss)
 
+    def reset_kv(self) -> None:
+        for block in self.trans_blocks:
+            block.attn.kv_buf.reset()
+
     @torch.no_grad
-    def generate(self, ctx: torch.Tensor, max_tokens: int) -> torch.Tensor:
+    def generate(
+        self,
+        ctx: torch.Tensor,
+        max_tokens: int,
+        times: list[float] | None = None,
+    ) -> torch.Tensor:
         was_training = self.training
         _ = self.eval()
+        self.reset_kv()
         d_time = self.cfg.d_time
         ctx_size = ctx.shape[1]
         decode_pos = ctx_size - 1
         for _ in range(max_tokens):
+            started = time.perf_counter()
             # Position table only covers [0, d_time); never feed a longer window
             if ctx_size == d_time:
                 ctx_cond = ctx[:, -d_time:]
@@ -442,6 +456,8 @@ class BigramLanguageModel(nn.Module):
             next_token = torch.multinomial(probs, num_samples=1)
             ctx = torch.cat((ctx, next_token), dim=1)
             ctx_size = min(d_time, ctx.shape[1])
+            if times is not None:
+                times.append(time.perf_counter() - started)
 
         if was_training:
             _ = self.train()
